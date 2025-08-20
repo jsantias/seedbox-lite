@@ -153,11 +153,26 @@ const client = new WebTorrent({
     
     // Avoid going offline by keeping connections alive
     keepSeeding: true,
-    
+
     // Throttle UDP traffic to avoid triggering anti-DoS mechanisms
-    utp: true                // Use uTP protocol which is more network-friendly
+    // NOTE: do NOT enable uTP here by default because the native
+    // `utp-native` addon can cause segmentation faults in some
+    // musl/alpine environments. uTP is now opt-in via the
+    // WEBTORRENT_ENABLE_UTP environment variable.
   })
 });
+
+// Determine whether to enable uTP from environment (opt-in)
+const enableUtp = process.env.WEBTORRENT_ENABLE_UTP === 'true';
+
+console.log(`WebTorrent uTP enabled: ${enableUtp ? 'yes' : 'no'} (use WEBTORRENT_ENABLE_UTP=true to enable)`);
+
+// If uTP is disabled, override client options to avoid loading native bindings
+if (!enableUtp) {
+  // Some WebTorrent internals may try to load utp-native. Setting
+  // `utp: false` here avoids that.
+  client.utp = false;
+}
 
 // UNIVERSAL STORAGE SYSTEM - Multiple ways to find torrents
 const torrents = {};           // Active torrent objects by infoHash
@@ -1703,11 +1718,17 @@ app.get('/api/torrents/:identifier/imdb', async (req, res) => {
   // Add a timeout to prevent hanging requests from external APIs
   const requestTimeout = setTimeout(() => {
     console.log(`⏱️ IMDB request timed out for: ${identifier}`);
-    if (!res.headersSent) {
-      res.status(503).json({ 
-        error: 'Request timeout', 
-        message: 'IMDB data request timed out, try again later'
-      });
+    try {
+      if (!res.headersSent) {
+        res.status(503).json({ 
+          error: 'Request timeout', 
+          message: 'IMDB data request timed out, try again later'
+        });
+      } else {
+        console.log('⏱️ IMDB timeout: response already sent, skipping timeout response');
+      }
+    } catch (e) {
+      console.log('⚠️ Error sending timeout response for IMDB endpoint:', e.message);
     }
   }, 15000); // 15 second timeout for API calls
   
@@ -1729,7 +1750,9 @@ app.get('/api/torrents/:identifier/imdb', async (req, res) => {
     if (!torrent) {
       clearTimeout(requestTimeout);
       if (debugLevel) console.log(`❌ Torrent not found for identifier: ${identifier}`);
-      return res.status(404).json({ error: 'Torrent not found' });
+      if (!res.headersSent) return res.status(404).json({ error: 'Torrent not found' });
+      console.log('❌ Torrent not found but response already sent');
+      return;
     }
     
     if (debugLevel) console.log(`🎬 Found torrent: ${torrent.name}, fetching IMDB data...`);
@@ -1772,12 +1795,28 @@ app.get('/api/torrents/:identifier/imdb', async (req, res) => {
     global[`${cacheKey}_time`] = now;
     
     clearTimeout(requestTimeout);
-    res.json(response);
+    try {
+      if (!res.headersSent) {
+        res.json(response);
+      } else {
+        console.log('ℹ️ IMDB handler: response already sent, skipping final json send');
+      }
+    } catch (e) {
+      console.log('⚠️ Error sending IMDB response:', e.message);
+    }
     
   } catch (error) {
     clearTimeout(requestTimeout);
     console.error(`❌ IMDB endpoint failed:`, error.message);
-    res.status(500).json({ error: 'Failed to get IMDB data: ' + error.message });
+    try {
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Failed to get IMDB data: ' + error.message });
+      } else {
+        console.log('❌ IMDB endpoint error occurred but response already sent');
+      }
+    } catch (e) {
+      console.log('⚠️ Error sending IMDB error response:', e.message);
+    }
   }
 });
 
