@@ -53,11 +53,20 @@ SeedBox Lite is a cutting-edge torrent streaming platform that allows you to wat
 
 ### Technical Features
 - **Password Authentication** - Secure access control
+- **Slack Integration** - Manage torrents from Slack with rich notifications
 - **CORS Enabled** - Cross-origin resource sharing for flexible deployment
 - **Health Monitoring** - Built-in health checks and monitoring
 - **Production Ready** - Optimized for production deployments
 - **Docker Support** - Easy containerized deployment
 - **PM2 Integration** - Process management for Node.js applications
+
+### Slack Bot Features
+- **🎬 Type Classification** - Organize by Movies or TV shows
+- **📁 Storage Management** - Custom download destinations
+- **🎉 Auto Notifications** - Alerts when downloads complete
+- **💬 Slash Commands** - `/torrent`, `/torrent-list`, `/torrent-location`, `/torrent-move`
+- **📊 Progress Tracking** - Real-time download status in Slack
+- **📍 Location Listing** - View where all torrents are stored
 
 ### Mobile Optimizations
 - **iOS Safari Support** - Native fullscreen using WebKit APIs
@@ -376,6 +385,17 @@ npm run test:load
 |----------|---------|-------------|
 | `BACKEND_PORT` | `3001` | Docker backend port mapping |
 | `FRONTEND_PORT` | `5174` | Docker frontend port mapping |
+
+#### Slack Integration Variables (Optional)
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SLACK_BOT_TOKEN` | - | Bot User OAuth Token from Slack |
+| `SLACK_SIGNING_SECRET` | - | Signing Secret from Slack |
+| `SLACK_APP_TOKEN` | - | App-level token for Socket Mode |
+| `SLACK_PORT` | `3002` | Port for Slack events |
+| `SLACK_AUTO_ADD_TORRENTS` | `false` | Auto-add torrents from messages |
+
+**📖 [Slack Setup Guide](SLACK_SETUP.md)** - Complete guide to setting up Slack integration
 
 ### Advanced Configuration
 

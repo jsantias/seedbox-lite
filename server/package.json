@@ -8,10 +8,12 @@
     "start:docker": "cp .env.docker .env && node index.js"
   },
   "dependencies": {
+    "@slack/bolt": "^4.6.0",
     "cors": "2.8.5",
     "dotenv": "^17.2.1",
     "express": "4.18.2",
     "multer": "^2.0.2",
+    "torrent-search-api": "^2.1.4",
     "webtorrent": "^1.9.7"
   }
 }

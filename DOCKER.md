@@ -229,6 +229,20 @@ docker-compose exec seedbox-backend sh
 docker-compose exec seedbox-frontend sh
 ```
 
+### Notes on `.well-known` and uTP
+
+- `.well-known` exceptions: the frontend nginx config explicitly allows requests to `/.well-known/` (for ACME challenges, browser metadata like `/ .well-known/appspecific/...`, etc.) before the rule that denies access to hidden files. This is intentional — it permits necessary metadata while still blocking other dot-files. If you change this behavior, be aware of the trade-off between letting specific well-known resources through and exposing hidden files.
+
+- uTP (utp-native) and stability: WebTorrent optionally uses the native `utp-native` addon for uTP transport. On some minimal/musl (Alpine) images this native addon can cause segmentation faults (container exit code 139). To maximize stability in Docker images, uTP is disabled by default; enable it only if you understand the environment and need uTP:
+
+```bash
+# Enable uTP (may require additional build tools or a glibc-based image)
+WEBTORRENT_ENABLE_UTP=true docker-compose up --build
+```
+
+If you need uTP and run into native build issues, consider using a glibc-based image (e.g., Debian/Ubuntu node images) or building `utp-native` with the appropriate toolchain.
+
+
 ## 🔄 Updates & Maintenance
 
 ### Update Application
