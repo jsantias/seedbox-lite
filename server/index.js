@@ -5,6 +5,7 @@ const cors = require('cors');
 const path = require('path');
 const WebTorrent = require('webtorrent');
 const multer = require('multer');
+const SlackHandler = require('./handlers/slackHandler');
 
 // Environment Configuration with production optimizations
 const config = {
@@ -2280,16 +2281,384 @@ function disableSeedingForCompletedTorrents() {
   return completedCount;
 }
 
+// Initialize Slack Bot Handler
+const slackHandler = new SlackHandler({
+  frontendUrl: config.frontend.url
+});
+
+// Set up torrent handler for Slack
+slackHandler.setTorrentHandler(async (magnetLink, type, destination) => {
+  try {
+    console.log(`📥 Slack adding torrent - Type: ${type || 'none'}, Destination: ${destination || 'default'}`);
+
+    // Add torrent using the existing API logic
+    const torrent = await universalTorrentResolver(magnetLink);
+
+    if (!torrent) {
+      // Try direct loading
+      const newTorrent = await loadTorrentFromId(magnetLink);
+
+      // Ensure we have an infoHash
+      if (!newTorrent || !newTorrent.infoHash) {
+        console.error('❌ Torrent loaded but no infoHash available');
+        throw new Error('Failed to get torrent hash');
+      }
+
+      console.log(`✅ Torrent added with hash: ${newTorrent.infoHash}`);
+
+      return {
+        success: true,
+        infoHash: newTorrent.infoHash,
+        name: newTorrent.name || 'Loading...',
+        size: newTorrent.length || 0,
+        files: newTorrent.files || [],
+        progress: Math.round((newTorrent.progress || 0) * 100),
+        status: 'loaded'
+      };
+    }
+
+    // Ensure we have an infoHash
+    if (!torrent.infoHash) {
+      console.error('❌ Torrent found but no infoHash available');
+      throw new Error('Failed to get torrent hash');
+    }
+
+    console.log(`✅ Torrent found with hash: ${torrent.infoHash}`);
+
+    return {
+      success: true,
+      infoHash: torrent.infoHash,
+      name: torrent.name || 'Loading...',
+      size: torrent.length || 0,
+      files: torrent.files || [],
+      progress: Math.round((torrent.progress || 0) * 100),
+      status: 'found'
+    };
+  } catch (error) {
+    // Handle duplicate torrent error
+    if (error.message.includes('duplicate torrent')) {
+      let hash = magnetLink;
+      if (magnetLink.startsWith('magnet:')) {
+        const match = magnetLink.match(/xt=urn:btih:([a-fA-F0-9]{40})/i);
+        if (match) hash = match[1].toLowerCase();
+      }
+
+      console.log(`🔍 Looking for existing torrent with hash: ${hash}`);
+
+      const existingTorrent = Object.values(torrents).find(t =>
+        t.infoHash && (
+          t.infoHash.toLowerCase() === hash.toLowerCase()
+        )
+      ) || client.torrents.find(t =>
+        t.infoHash && (
+          t.infoHash.toLowerCase() === hash.toLowerCase()
+        )
+      );
+
+      if (existingTorrent) {
+        console.log(`✅ Found existing torrent with hash: ${existingTorrent.infoHash}`);
+        return {
+          success: true,
+          infoHash: existingTorrent.infoHash,
+          name: existingTorrent.name || 'Loading...',
+          size: existingTorrent.length || 0,
+          files: existingTorrent.files || [],
+          progress: Math.round((existingTorrent.progress || 0) * 100),
+          status: 'existing',
+          message: 'Torrent already added'
+        };
+      }
+
+      // If we can't find it but got a hash from the magnet link, return that
+      if (hash && hash.length === 40) {
+        console.log(`⚠️ Duplicate detected, returning hash: ${hash}`);
+        return {
+          success: true,
+          infoHash: hash,
+          name: 'Duplicate torrent',
+          size: 0,
+          files: [],
+          progress: 0,
+          status: 'duplicate',
+          message: 'Torrent already added'
+        };
+      }
+    }
+
+    console.error(`❌ Torrent handler error: ${error.message}`);
+    throw error;
+  }
+});
+
+// Set up torrent list handler for Slack
+slackHandler.setTorrentListHandler(async () => {
+  const activeTorrents = [];
+  for (const key in torrents) {
+    const torrent = torrents[key];
+    if (!torrent) continue;
+
+    activeTorrents.push({
+      infoHash: torrent.infoHash,
+      name: torrent.name,
+      size: torrent.length || 0,
+      progress: Math.round((torrent.progress || 0) * 100),
+      downloadSpeed: torrent.downloadSpeed || 0,
+      peers: torrent.numPeers || 0
+    });
+  }
+  return activeTorrents;
+});
+
+// Set up torrent move handler for Slack - Actual file moving implementation
+slackHandler.setTorrentMoveHandler(async (infoHash, newDestination) => {
+  const fs = require('fs').promises;
+  const fsSync = require('fs');
+  const path = require('path');
+
+  try {
+    console.log(`📦 Moving torrent ${infoHash} to: ${newDestination}`);
+
+    // Find the torrent
+    const torrent = torrents[infoHash] || client.torrents.find(t =>
+      t.infoHash.toLowerCase() === infoHash.toLowerCase()
+    );
+
+    if (!torrent) {
+      throw new Error('Torrent not found');
+    }
+
+    // Check if torrent is complete
+    const isComplete = torrent.progress === 1;
+
+    if (!isComplete) {
+      console.log(`⏳ Torrent not complete yet (${Math.round(torrent.progress * 100)}%). Move will happen when download finishes.`);
+      return {
+        success: true,
+        status: 'scheduled',
+        message: 'Move scheduled for when download completes'
+      };
+    }
+
+    // Ensure destination directory exists
+    if (!fsSync.existsSync(newDestination)) {
+      console.log(`📁 Creating destination directory: ${newDestination}`);
+      await fs.mkdir(newDestination, { recursive: true });
+    }
+
+    // Get current download path (this is the base directory)
+    const currentPath = torrent.path;
+
+    if (!currentPath) {
+      throw new Error('Cannot determine current torrent path');
+    }
+
+    // Resolve to absolute path
+    const absoluteCurrentPath = path.resolve(currentPath);
+    const absoluteNewDestination = path.resolve(newDestination);
+
+    console.log(`📂 Current location: ${absoluteCurrentPath}`);
+    console.log(`📂 New location: ${absoluteNewDestination}`);
+
+    // Move each file
+    const movedFiles = [];
+    const errors = [];
+
+    for (const file of torrent.files) {
+      try {
+        // Build absolute source path
+        // file.path is relative to the torrent.path
+        const sourcePath = path.resolve(currentPath, file.path);
+
+        // Preserve directory structure in destination
+        const relativePath = file.path;
+        const destPath = path.join(absoluteNewDestination, relativePath);
+
+        console.log(`🔍 Checking: ${relativePath}`);
+        console.log(`   Source: ${sourcePath}`);
+        console.log(`   Dest: ${destPath}`);
+
+        // Check if source exists
+        if (!fsSync.existsSync(sourcePath)) {
+          console.log(`⚠️ Source file not found: ${sourcePath}`);
+          errors.push(`File not found: ${relativePath}`);
+          continue;
+        }
+
+        // Create destination directory if needed
+        const destDir = path.dirname(destPath);
+        if (!fsSync.existsSync(destDir)) {
+          await fs.mkdir(destDir, { recursive: true });
+        }
+
+        // Check if destination already exists
+        if (fsSync.existsSync(destPath)) {
+          console.log(`⚠️ Destination file already exists: ${destPath}`);
+          errors.push(`File already exists: ${relativePath}`);
+          continue;
+        }
+
+        // Move the file
+        console.log(`🔄 Moving: ${relativePath}`);
+        await fs.rename(sourcePath, destPath);
+        movedFiles.push(relativePath);
+        console.log(`✅ Moved: ${relativePath}`);
+
+      } catch (error) {
+        console.error(`❌ Error moving file ${file.path}:`, error.message);
+        errors.push(`${file.path}: ${error.message}`);
+      }
+    }
+
+    // Summary
+    if (movedFiles.length > 0) {
+      console.log(`✅ Successfully moved ${movedFiles.length} file(s) to ${newDestination}`);
+    }
+
+    if (errors.length > 0) {
+      console.log(`⚠️ ${errors.length} file(s) had errors`);
+    }
+
+    return {
+      success: movedFiles.length > 0,
+      status: errors.length > 0 ? 'partial' : 'complete',
+      movedFiles: movedFiles.length,
+      totalFiles: torrent.files.length,
+      errors: errors.length > 0 ? errors : undefined,
+      message: `Moved ${movedFiles.length}/${torrent.files.length} files`
+    };
+
+  } catch (error) {
+    console.error(`❌ Move error:`, error.message);
+    throw error;
+  }
+});
+
+// Set up cache clear handler for Slack
+slackHandler.setCacheClearHandler(async (clearAll = false) => {
+  const fs = require('fs').promises;
+  const fsSync = require('fs');
+
+  try {
+    console.log(`🧹 Cache clear requested - Mode: ${clearAll ? 'all' : 'completed only'}`);
+
+    const removed = [];
+    const removedList = [];
+    let spaceFreed = 0;
+
+    // Get list of torrents to remove
+    const torrentsToRemove = [];
+
+    for (const key in torrents) {
+      const torrent = torrents[key];
+      if (!torrent) continue;
+
+      // If clearAll is true, remove everything
+      // Otherwise, only remove completed torrents
+      if (clearAll || torrent.progress >= 1) {
+        torrentsToRemove.push({
+          infoHash: torrent.infoHash,
+          name: torrent.name,
+          path: torrent.path,
+          size: torrent.length || 0
+        });
+      }
+    }
+
+    // Remove each torrent
+    for (const torrentInfo of torrentsToRemove) {
+      try {
+        console.log(`🗑️ Removing: ${torrentInfo.name}`);
+
+        // Find the torrent object
+        const torrent = client.torrents.find(t => t.infoHash === torrentInfo.infoHash);
+
+        if (torrent) {
+          // Destroy the torrent (removes from client and deletes files)
+          await new Promise((resolve, reject) => {
+            torrent.destroy({ destroyStore: true }, (err) => {
+              if (err) reject(err);
+              else resolve();
+            });
+          });
+
+          spaceFreed += torrentInfo.size;
+          removed.push(torrentInfo.infoHash);
+          removedList.push(torrentInfo.name);
+
+          // Clean up our internal storage
+          delete torrents[torrentInfo.infoHash];
+          delete torrentIds[torrentInfo.infoHash];
+          delete torrentNames[torrentInfo.infoHash];
+
+          console.log(`✅ Removed: ${torrentInfo.name}`);
+        }
+      } catch (error) {
+        console.error(`❌ Error removing ${torrentInfo.name}:`, error.message);
+      }
+    }
+
+    // Count remaining torrents
+    const remaining = Object.keys(torrents).length;
+
+    // Format space freed
+    const formatBytes = (bytes) => {
+      if (bytes === 0) return '0 Bytes';
+      const k = 1024;
+      const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+      const i = Math.floor(Math.log(bytes) / Math.log(k));
+      return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i];
+    };
+
+    console.log(`✅ Cache clear complete - Removed: ${removed.length}, Remaining: ${remaining}`);
+
+    return {
+      success: true,
+      removed: removed.length,
+      removedList,
+      remaining,
+      spaceFreed: formatBytes(spaceFreed)
+    };
+
+  } catch (error) {
+    console.error(`❌ Cache clear error:`, error.message);
+    throw error;
+  }
+});
+
+// Monitor torrent progress and send Slack notifications
+setInterval(async () => {
+  try {
+    const activeTorrents = [];
+    for (const key in torrents) {
+      const torrent = torrents[key];
+      if (!torrent) continue;
+      activeTorrents.push(torrent);
+    }
+
+    // Update Slack with progress (will trigger completion notifications)
+    await slackHandler.monitorProgress(activeTorrents);
+  } catch (error) {
+    // Silently fail - don't spam logs
+  }
+}, 10000); // Check every 10 seconds
+
 // Start server
 const PORT = config.server.port;
 const HOST = config.server.host;
 
-app.listen(PORT, "0.0.0.0", () => {
+app.listen(PORT, "0.0.0.0", async () => {
   const serverUrl = `${config.server.protocol}://${HOST}:${PORT}`;
   console.log(`🌱 Seedbox Lite server running on ${serverUrl}`);
   console.log(`📱 Frontend URL: ${config.frontend.url}`);
   console.log(`🚀 UNIVERSAL TORRENT RESOLUTION SYSTEM ACTIVE`);
-  
+
+  // Initialize Slack bot
+  try {
+    await slackHandler.initialize();
+  } catch (error) {
+    console.error('⚠️  Failed to initialize Slack bot:', error.message);
+  }
+
   // Disable seeding for any already completed torrents
   setTimeout(() => {
     const completedCount = disableSeedingForCompletedTorrents();
@@ -2297,10 +2666,10 @@ app.listen(PORT, "0.0.0.0", () => {
       console.log(`🛑 Disabled seeding for ${completedCount} already completed torrents`);
     }
   }, 5000); // Give the server 5 seconds to initialize properly
-  
+
   console.log(`🎯 ZERO "Not Found" Errors Guaranteed`);
   console.log(`⚠️  SECURITY: Download-only mode - Zero uploads guaranteed`);
-  
+
   if (config.isDevelopment) {
     console.log('🔧 Development mode - Environment variables loaded');
   }
